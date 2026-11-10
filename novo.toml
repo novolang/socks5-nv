@@ -1,0 +1,28 @@
+[package]
+name        = "socks5-nv"
+version     = "0.1.0"
+description = "SOCKS5 (RFC 1928) and its username and password authentication (RFC 1929) as a codec and two state machines with no socket: the greeting, the request and reply in the IPv4, domain and IPv6 forms, CONNECT, BIND and UDP ASSOCIATE, the UDP request header, and a client and a server that a caller drives with the bytes it reads."
+license     = "Apache-2.0"
+
+stability   = "experimental"
+
+# `host`: the API is lists of bytes and strings, which allocate, and a
+# proxy client or server runs on a machine with a heap.  No function
+# performs input or output; every effect row is empty, and the caller
+# owns the socket.
+layer       = "host"
+
+category    = "networking"
+
+tags        = ["socks5", "socks", "rfc1928", "rfc1929", "proxy", "codec", "sans-io", "state-machine"]
+repository  = "https://github.com/novolang/socks5-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "SOCKS5, without a socket"
+
+[dependencies]

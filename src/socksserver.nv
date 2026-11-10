@@ -1,0 +1,254 @@
+// socksserver.nv — the server side of a SOCKS5 exchange as a state
+// machine the caller drives with bytes.
+//
+// The machine decides nothing that belongs to the proxy.  It reads the
+// greeting and picks a method from the list the caller configured.  It
+// hands the caller the credentials to check and the request to carry
+// out, and it writes whatever the caller answers: `server_authenticate`
+// for the credentials, `server_reply` for the request.  Opening the
+// outbound connection, resolving a name and relaying data are the
+// caller's.
+
+use sockscode
+use sockserr
+use sockswire
+
+// The methods the server accepts, most preferred first.  Only method 0
+// (no authentication) and method 2 (username and password) have an
+// exchange here; any other number in the list is never chosen.
+pub struct SocksServerConfig
+    methods: [Int]
+
+// A configuration that accepts the methods in `methods`, in that order.
+pub fn server_config(methods: [Int]) -> SocksServerConfig
+    SocksServerConfig { methods: methods }
+
+// Where the exchange is.
+pub enum SocksServerPhase
+    // Waiting for the client's greeting.
+    SocksServerAwaitGreeting
+    // Waiting for the client's user name and password.
+    SocksServerAwaitCredentials
+    // The credentials are with the caller; `server_authenticate` is next.
+    SocksServerAwaitVerdict
+    // Waiting for the client's request.
+    SocksServerAwaitRequest
+    // The request is with the caller; `server_reply` is next.
+    SocksServerAwaitAnswer
+    // A BIND is listening; `server_reply` is next, with the peer's
+    // address.
+    SocksServerAwaitPeer
+    // The request succeeded.  Further bytes belong to the tunnel.
+    SocksServerOpen
+    // The exchange ended in a refusal or a fault.
+    SocksServerEnded
+
+// The state of one exchange.
+pub struct SocksServer
+    config: SocksServerConfig
+    phase: SocksServerPhase
+    // Bytes read and not yet part of a whole message.  Bytes that arrive
+    // while the machine waits for the caller are kept here, and once the
+    // exchange is open they are the first bytes of the tunnel.
+    pending: [u8]
+    // The command of the request being answered.
+    command: SocksCommand
+
+// Something a read completed.
+pub enum SocksServerEvent
+    // The client sent a user name and password.  The caller checks them
+    // and calls `server_authenticate`.
+    SocksServerCredentialsRead(credentials: SocksCredentials)
+    // The client sent a request.  The caller carries it out and calls
+    // `server_reply`.
+    SocksServerRequestRead(request: SocksRequest)
+    // The exchange failed.
+    SocksServerFailed(error: SocksError)
+
+// What a call to the machine answers.
+pub struct SocksServerStep
+    server: SocksServer
+    // Bytes to write to the client, possibly none.
+    output: [u8]
+    // Events, in the order they happened, possibly none.
+    events: [SocksServerEvent]
+
+// A server waiting for a greeting.
+pub fn server_start(config: SocksServerConfig) -> SocksServer
+    SocksServer { config: config, phase: SocksServerAwaitGreeting, pending: [],
+                  command: SocksConnect }
+
+// Whether the exchange has finished, in either direction.
+pub fn server_is_done(s: SocksServer) -> Bool
+    match s.phase
+        SocksServerOpen  => true
+        SocksServerEnded => true
+        _                => false
+
+// Whether the proxy is carrying the connection.
+pub fn server_is_open(s: SocksServer) -> Bool
+    match s.phase
+        SocksServerOpen => true
+        _               => false
+
+// The first method of the server's list that the client offered and
+// that this machine can carry out, or -1.
+fn pick_method(accepted: [Int], offered: [Int]) -> Int
+    for m in accepted
+        if list.contains(offered, m)
+            if m == sockscode.SOCKS_METHOD_NONE or m == sockscode.SOCKS_METHOD_PASSWORD
+                return m
+    -1
+
+// Hand the machine bytes read from the client.
+//
+// Bytes that arrive while the machine waits for the caller are kept in
+// `pending`.  Bytes that arrive after the exchange has ended are
+// reported as `SocksWrongState`.
+pub fn server_feed(s: SocksServer, data: [u8]) -> SocksServerStep
+    if server_is_done(s)
+        return server_wrong_state(s)
+    var buf: [u8] = []
+    for b in s.pending
+        list.push(buf, b)
+    for b in data
+        list.push(buf, b)
+    server_run(s.config, s.phase, s.command, buf, [])
+
+// The step for a call that is not valid in the current phase.
+fn server_wrong_state(s: SocksServer) -> SocksServerStep
+    SocksServerStep { server: s, output: [], events: [SocksServerFailed(SocksWrongState)] }
+
+// Whether a fault is an address type the machine could not read.
+fn is_address_type_fault(e: SocksError) -> Bool
+    match e
+        SocksBadAddressType(_) => true
+        _                      => false
+
+// Read as many whole messages as `buf` holds, in the phases that wait
+// for the client, and answer the step.  `first` is output already
+// written.
+fn server_run(config: SocksServerConfig, start_phase: SocksServerPhase, command: SocksCommand,
+              buf: [u8], first: [u8]) -> SocksServerStep
+    var phase = start_phase
+    var cmd = command
+    var pos = 0
+    var out: [u8] = []
+    for b in first
+        list.push(out, b)
+    var events: [SocksServerEvent] = []
+    var going = true
+    while going
+        match phase
+            SocksServerAwaitGreeting    =>
+                match sockswire.decode_greeting(buf, pos)
+                    Err(e) =>
+                        going = false
+                        if not sockserr.is_incomplete(e)
+                            list.push(events, SocksServerFailed(e))
+                            phase = SocksServerEnded
+                    Ok(g)  =>
+                        pos = g.next
+                        let m = pick_method(config.methods, g.methods)
+                        if m < 0
+                            let _n = sockswire.encode_method_selection(var out, sockscode.SOCKS_METHOD_NO_ACCEPTABLE)
+                            list.push(events, SocksServerFailed(SocksNoAcceptableMethod))
+                            phase = SocksServerEnded
+                            going = false
+                        else
+                            let _s = sockswire.encode_method_selection(var out, m)
+                            if m == sockscode.SOCKS_METHOD_PASSWORD
+                                phase = SocksServerAwaitCredentials
+                            else
+                                phase = SocksServerAwaitRequest
+            SocksServerAwaitCredentials =>
+                match sockswire.decode_auth_request(buf, pos)
+                    Err(e) =>
+                        going = false
+                        if not sockserr.is_incomplete(e)
+                            list.push(events, SocksServerFailed(e))
+                            phase = SocksServerEnded
+                    Ok(a)  =>
+                        pos = a.next
+                        list.push(events, SocksServerCredentialsRead(a.credentials))
+                        phase = SocksServerAwaitVerdict
+                        going = false
+            SocksServerAwaitRequest     =>
+                match sockswire.decode_request(buf, pos)
+                    Err(e) =>
+                        going = false
+                        if not sockserr.is_incomplete(e)
+                            // Reply 8 for an address type the machine
+                            // cannot read (RFC 1928 section 6).
+                            if is_address_type_fault(e)
+                                let _f = sockswire.encode_reply(var out,
+                                    sockswire.failure_reply(SocksReplyAddressTypeNotSupported))
+                            list.push(events, SocksServerFailed(e))
+                            phase = SocksServerEnded
+                    Ok(r)  =>
+                        pos = r.next
+                        going = false
+                        match r.request.command
+                            SocksCommandOther(code) =>
+                                let _u = sockswire.encode_reply(var out, sockswire.failure_reply(SocksReplyCommandNotSupported))
+                                list.push(events, SocksServerFailed(SocksUnsupportedCommand(code)))
+                                phase = SocksServerEnded
+                            _                       =>
+                                list.push(events, SocksServerRequestRead(r.request))
+                                phase = SocksServerAwaitAnswer
+                                cmd = r.request.command
+            _                           =>
+                // The machine is waiting for the caller.
+                going = false
+    SocksServerStep { server: SocksServer { config: config, phase: phase, pending: buf[pos:],
+                                            command: cmd },
+                      output: out, events: events }
+
+// Answer the credentials the last step reported: `accepted` is the
+// caller's verdict.  A rejection writes status 1 and ends the exchange,
+// as RFC 1929 section 2 requires the connection to close.  An
+// acceptance goes on to read the request, which may already be waiting
+// in `pending`.
+pub fn server_authenticate(s: SocksServer, accepted: Bool) -> SocksServerStep
+    match s.phase
+        SocksServerAwaitVerdict => 0
+        _                       =>
+            return server_wrong_state(s)
+    var out: [u8] = []
+    let _a = sockswire.encode_auth_reply(var out, (if accepted then 0 else 1))
+    if accepted
+        return server_run(s.config, SocksServerAwaitRequest, s.command, s.pending, out)
+    let ended = SocksServer { config: s.config, phase: SocksServerEnded, pending: [],
+                              command: s.command }
+    SocksServerStep { server: ended, output: out, events: [] }
+
+// Answer the request the last step reported, or, after a successful
+// reply to BIND, the peer that connected.
+//
+// A reply other than success ends the exchange.  A success opens it,
+// except for the first reply to BIND, which leaves the machine waiting
+// for the second.  A reply that cannot be written, because its port is
+// out of range or its address is malformed, writes nothing, changes
+// nothing and is reported as a failure event.
+pub fn server_reply(s: SocksServer, message: SocksReplyMessage) -> SocksServerStep
+    let awaiting_peer = match s.phase
+        SocksServerAwaitPeer => true
+        _                    => false
+    let awaiting_answer = match s.phase
+        SocksServerAwaitAnswer => true
+        _                      => false
+    if not awaiting_peer and not awaiting_answer
+        return server_wrong_state(s)
+    var out: [u8] = []
+    match sockswire.encode_reply(var out, message)
+        Err(e) =>
+            return SocksServerStep { server: s, output: [], events: [SocksServerFailed(e)] }
+        Ok(_)  => 0
+    var phase = SocksServerOpen
+    if not sockscode.reply_is_success(message.reply)
+        phase = SocksServerEnded
+    elif awaiting_answer and sockscode.command_code(s.command) == 2
+        phase = SocksServerAwaitPeer
+    SocksServerStep { server: SocksServer { config: s.config, phase: phase, pending: s.pending,
+                                            command: s.command },
+                      output: out, events: [] }

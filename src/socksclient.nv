@@ -1,0 +1,226 @@
+// socksclient.nv — the client side of a SOCKS5 exchange as a state
+// machine the caller drives with bytes.
+//
+// The machine opens no socket.  `client_start` answers the greeting to
+// send.  Each read from the proxy goes to `client_feed`, which answers
+// the bytes to send next and the events the read completed.  A read may
+// hold half a message or several, so the machine keeps what it has not
+// yet used.
+//
+// The exchange: greeting, the server's choice of method, the user name
+// and password when that method is chosen, the request, and the reply.
+// BIND has a second reply, sent when the peer connects.
+
+use sockscode
+use socksaddr
+use sockserr
+use sockswire
+
+// What the client asks for.
+pub struct SocksClientConfig
+    // The methods offered, in the order they are listed in the greeting.
+    methods: [Int]
+    // Used when the server chooses method 2.  Both fields are empty
+    // when no credentials are configured.
+    credentials: SocksCredentials
+    command: SocksCommand
+    // The destination: the host to reach for CONNECT, the host expected
+    // to connect for BIND, the address the datagrams come from for UDP
+    // ASSOCIATE.
+    address: SocksAddress
+    port: Int
+
+// A configuration that offers "no authentication" only.
+pub fn client_config(command: SocksCommand, address: SocksAddress, port: Int) -> SocksClientConfig
+    SocksClientConfig { methods: [sockscode.SOCKS_METHOD_NONE],
+                        credentials: SocksCredentials { username: "", password: "" },
+                        command: command, address: address, port: port }
+
+// The same request, offering "no authentication" and "username and
+// password", with the credentials to use if the server picks the second.
+pub fn client_with_credentials(c: SocksClientConfig, username: Str,
+                               password: Str) -> SocksClientConfig
+    SocksClientConfig { methods: [sockscode.SOCKS_METHOD_NONE, sockscode.SOCKS_METHOD_PASSWORD],
+                        credentials: SocksCredentials { username: username, password: password },
+                        command: c.command, address: c.address, port: c.port }
+
+// The same request offering exactly these methods.
+pub fn client_with_methods(c: SocksClientConfig, methods: [Int]) -> SocksClientConfig
+    SocksClientConfig { methods: methods, credentials: c.credentials,
+                        command: c.command, address: c.address, port: c.port }
+
+// Where the exchange is.
+pub enum SocksClientPhase
+    // The greeting is sent; the server's choice of method is next.
+    SocksClientAwaitMethod
+    // The credentials are sent; the server's verdict is next.
+    SocksClientAwaitAuth
+    // The request is sent; the reply is next.
+    SocksClientAwaitReply
+    // A BIND is listening; the second reply, when the peer connects,
+    // is next.
+    SocksClientAwaitPeer
+    // The exchange succeeded.  Further bytes belong to the tunnel.
+    SocksClientOpen
+    // The exchange ended in a refusal or a fault.
+    SocksClientEnded
+
+// The state of one exchange.
+pub struct SocksClient
+    config: SocksClientConfig
+    phase: SocksClientPhase
+    // Bytes read and not yet part of a whole message.
+    pending: [u8]
+
+// Something a read completed.
+pub enum SocksClientEvent
+    // A BIND request succeeded: the server is listening at this
+    // address.  The second reply follows when the peer connects.
+    SocksClientListening(message: SocksReplyMessage)
+    // The request succeeded.  `leftover` is what the server sent after
+    // the reply, which is the first bytes of the tunnel.
+    SocksClientEstablished(message: SocksReplyMessage, leftover: [u8])
+    // The server refused the request with a reply other than 0.
+    SocksClientRefused(message: SocksReplyMessage)
+    // The exchange failed.
+    SocksClientFailed(error: SocksError)
+
+// What a call to the machine answers.
+pub struct SocksClientStep
+    client: SocksClient
+    // Bytes to write to the proxy, possibly none.
+    output: [u8]
+    // Events, in the order they happened, possibly none.
+    events: [SocksClientEvent]
+
+// Check the configuration and answer the greeting to send.
+pub fn client_start(config: SocksClientConfig) -> Result<SocksClientStep, SocksError>
+    var scratch: [u8] = []
+    // The request is checked now, so that a fault in it is the caller's
+    // and not the exchange's.
+    sockswire.encode_request(var scratch, SocksRequest { command: config.command,
+                                                         address: config.address,
+                                                         port: config.port })!
+    if list.contains(config.methods, sockscode.SOCKS_METHOD_PASSWORD)
+        match sockswire.encode_auth_request(var scratch, config.credentials)
+            Err(_) =>
+                return Err(SocksMissingCredentials)
+            Ok(_)  => 0
+    var out: [u8] = []
+    sockswire.encode_greeting(var out, config.methods)!
+    let client = SocksClient { config: config, phase: SocksClientAwaitMethod, pending: [] }
+    Ok(SocksClientStep { client: client, output: out, events: [] })
+
+// The request the configuration describes.
+fn request_of(c: SocksClientConfig) -> SocksRequest
+    SocksRequest { command: c.command, address: c.address, port: c.port }
+
+// Whether the exchange has finished, in either direction.
+pub fn client_is_done(c: SocksClient) -> Bool
+    match c.phase
+        SocksClientOpen  => true
+        SocksClientEnded => true
+        _                => false
+
+// Whether the proxy is carrying the connection: the request succeeded
+// and the bytes that follow belong to the application.
+pub fn client_is_established(c: SocksClient) -> Bool
+    match c.phase
+        SocksClientOpen => true
+        _               => false
+
+// Hand the machine bytes read from the proxy.
+//
+// Bytes that arrive after the exchange has ended are not part of it, and
+// the step reports `SocksWrongState` for them without changing the
+// machine.
+pub fn client_feed(c: SocksClient, data: [u8]) -> SocksClientStep
+    if client_is_done(c)
+        return SocksClientStep { client: c, output: [], events: [SocksClientFailed(SocksWrongState)] }
+    var buf: [u8] = []
+    for b in c.pending
+        list.push(buf, b)
+    for b in data
+        list.push(buf, b)
+    var phase = c.phase
+    var pos = 0
+    var out: [u8] = []
+    var events: [SocksClientEvent] = []
+    var going = true
+    while going
+        match phase
+            SocksClientAwaitMethod =>
+                match sockswire.decode_method_selection(buf, pos)
+                    Err(e) =>
+                        going = false
+                        if not sockserr.is_incomplete(e)
+                            list.push(events, SocksClientFailed(e))
+                            phase = SocksClientEnded
+                    Ok(m)  =>
+                        pos = m.next
+                        if m.method == sockscode.SOCKS_METHOD_NO_ACCEPTABLE
+                            list.push(events, SocksClientFailed(SocksNoAcceptableMethod))
+                            phase = SocksClientEnded
+                            going = false
+                        elif not list.contains(c.config.methods, m.method)
+                            list.push(events, SocksClientFailed(SocksMethodNotOffered(m.method)))
+                            phase = SocksClientEnded
+                            going = false
+                        elif m.method == sockscode.SOCKS_METHOD_PASSWORD
+                            let _a = sockswire.encode_auth_request(var out, c.config.credentials)
+                            phase = SocksClientAwaitAuth
+                        elif m.method == sockscode.SOCKS_METHOD_NONE
+                            let _r = sockswire.encode_request(var out, request_of(c.config))
+                            phase = SocksClientAwaitReply
+                        else
+                            list.push(events, SocksClientFailed(SocksNoAcceptableMethod))
+                            phase = SocksClientEnded
+                            going = false
+            SocksClientAwaitAuth   =>
+                match sockswire.decode_auth_reply(buf, pos)
+                    Err(e) =>
+                        going = false
+                        if not sockserr.is_incomplete(e)
+                            list.push(events, SocksClientFailed(e))
+                            phase = SocksClientEnded
+                    Ok(r)  =>
+                        pos = r.next
+                        if r.status != 0
+                            list.push(events, SocksClientFailed(SocksAuthRejected(r.status)))
+                            phase = SocksClientEnded
+                            going = false
+                        else
+                            let _r = sockswire.encode_request(var out, request_of(c.config))
+                            phase = SocksClientAwaitReply
+            _                      =>
+                // A reply: the first one, or the BIND peer's.
+                match sockswire.decode_reply(buf, pos)
+                    Err(e) =>
+                        going = false
+                        if not sockserr.is_incomplete(e)
+                            list.push(events, SocksClientFailed(e))
+                            phase = SocksClientEnded
+                    Ok(r)  =>
+                        pos = r.next
+                        let first = is_first_reply(phase)
+                        if not sockscode.reply_is_success(r.message.reply)
+                            list.push(events, SocksClientRefused(r.message))
+                            phase = SocksClientEnded
+                            going = false
+                        elif first and sockscode.command_code(c.config.command) == 2
+                            list.push(events, SocksClientListening(r.message))
+                            phase = SocksClientAwaitPeer
+                        else
+                            list.push(events, SocksClientEstablished(r.message, buf[pos:]))
+                            phase = SocksClientOpen
+                            pos = list.len(buf)
+                            going = false
+    let kept = SocksClient { config: c.config, phase: phase, pending: buf[pos:] }
+    SocksClientStep { client: kept, output: out, events: events }
+
+// Whether the next reply is the first one, as opposed to the second
+// reply of a BIND.
+fn is_first_reply(p: SocksClientPhase) -> Bool
+    match p
+        SocksClientAwaitReply => true
+        _                     => false

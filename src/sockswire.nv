@@ -1,0 +1,300 @@
+// sockswire.nv — the messages of RFC 1928 and RFC 1929 as values and as
+// bytes.
+//
+// Every decoder reads at an offset in the caller's bytes and answers the
+// value with the offset of the byte after it, or `SocksTruncated` when
+// the bytes stop first.  A caller on a stream keeps what it has read and
+// calls again after the next read.  Every encoder appends to a list the
+// caller owns and answers the number of bytes it wrote.
+
+use std.str
+use sockscode
+use socksaddr
+use sockserr
+
+// The version byte of every SOCKS5 message.
+pub const SOCKS_VERSION = 5
+// The version byte of the username and password sub-negotiation.
+pub const SOCKS_AUTH_VERSION = 1
+
+// Append every byte of `tail` to `out`.
+fn push_all(var out: [u8], tail: [u8])
+    for b in tail
+        list.push(out, b)
+
+// Append a sixteen-bit field, most significant byte first.
+fn push16(var out: [u8], v: Int)
+    list.push(out, ((v >> 8) & 255) as u8)
+    list.push(out, (v & 255) as u8)
+
+// The sixteen-bit field at `at`.
+fn get16(data: [u8], at: Int) -> Int
+    (data[at] as Int << 8) | data[at + 1] as Int
+
+// A port is a sixteen-bit number.
+fn check_port(port: Int) -> Result<Int, SocksError>
+    if port < 0 or port > 65535
+        return Err(SocksBadPort(port))
+    Ok(port)
+
+// A version byte at `at`, which must be `want`.
+fn check_version(data: [u8], at: Int) -> Result<Int, SocksError>
+    sockserr.require(data, at, 1)!
+    let v = data[at] as Int
+    if v != SOCKS_VERSION
+        return Err(SocksBadVersion(v))
+    Ok(v)
+
+// ── Method negotiation (RFC 1928 section 3) ─────────────────────────
+
+// The methods a client offers, and the offset after the greeting.
+pub struct SocksGreetingRead
+    methods: [Int]
+    next: Int
+
+// Append the client's greeting: VER, NMETHODS and the methods.  One to
+// 255 methods, each a byte.
+pub fn encode_greeting(var out: [u8], methods: [Int]) -> Result<Int, SocksError>
+    let n = list.len(methods)
+    if n < 1 or n > 255
+        return Err(SocksBadMethodCount(n))
+    for m in methods
+        if m < 0 or m > 255
+            return Err(SocksBadMethod(m))
+    list.push(out, SOCKS_VERSION as u8)
+    list.push(out, n as u8)
+    for m in methods
+        list.push(out, m as u8)
+    Ok(2 + n)
+
+// Read the client's greeting at `at`.
+pub fn decode_greeting(data: [u8], at: Int) -> Result<SocksGreetingRead, SocksError>
+    sockserr.require(data, at, 2)!
+    check_version(data, at)!
+    let n = data[at + 1] as Int
+    if n < 1
+        return Err(SocksBadMethodCount(n))
+    sockserr.require(data, at, 2 + n)!
+    var methods: [Int] = []
+    for i in 0..n
+        list.push(methods, data[at + 2 + i] as Int)
+    Ok(SocksGreetingRead { methods: methods, next: at + 2 + n })
+
+// The method the server chose, and the offset after the message.
+pub struct SocksMethodRead
+    method: Int
+    next: Int
+
+// Append the server's choice: VER and METHOD.
+pub fn encode_method_selection(var out: [u8], method: Int) -> Result<Int, SocksError>
+    if method < 0 or method > 255
+        return Err(SocksBadMethod(method))
+    list.push(out, SOCKS_VERSION as u8)
+    list.push(out, method as u8)
+    Ok(2)
+
+// Read the server's choice at `at`.
+pub fn decode_method_selection(data: [u8], at: Int) -> Result<SocksMethodRead, SocksError>
+    sockserr.require(data, at, 2)!
+    check_version(data, at)!
+    Ok(SocksMethodRead { method: data[at + 1] as Int, next: at + 2 })
+
+// ── Username and password (RFC 1929) ────────────────────────────────
+
+// A user name and a password.
+pub struct SocksCredentials
+    username: Str
+    password: Str
+
+// The credentials of a request, and the offset after it.
+pub struct SocksAuthRequestRead
+    credentials: SocksCredentials
+    next: Int
+
+// A field of RFC 1929 is 1 to 255 bytes.
+fn check_credential(s: Str) -> Result<Int, SocksError>
+    let n = str.len(s)
+    if n < 1 or n > 255
+        return Err(SocksBadCredential(n))
+    Ok(n)
+
+// Append the client's request: VER 1, ULEN, UNAME, PLEN, PASSWD.
+pub fn encode_auth_request(var out: [u8], c: SocksCredentials) -> Result<Int, SocksError>
+    let ulen = check_credential(c.username)!
+    let plen = check_credential(c.password)!
+    list.push(out, SOCKS_AUTH_VERSION as u8)
+    list.push(out, ulen as u8)
+    socksaddr.push_text(var out, c.username)
+    list.push(out, plen as u8)
+    socksaddr.push_text(var out, c.password)
+    Ok(3 + ulen + plen)
+
+// Read the client's request at `at`.
+pub fn decode_auth_request(data: [u8], at: Int) -> Result<SocksAuthRequestRead, SocksError>
+    sockserr.require(data, at, 2)!
+    let v = data[at] as Int
+    if v != SOCKS_AUTH_VERSION
+        return Err(SocksBadAuthVersion(v))
+    let ulen = data[at + 1] as Int
+    if ulen < 1
+        return Err(SocksBadCredential(ulen))
+    sockserr.require(data, at, 3 + ulen)!
+    let plen = data[at + 2 + ulen] as Int
+    if plen < 1
+        return Err(SocksBadCredential(plen))
+    sockserr.require(data, at, 3 + ulen + plen)!
+    let c = SocksCredentials { username: socksaddr.text_from(data, at + 2, ulen),
+                               password: socksaddr.text_from(data, at + 3 + ulen, plen) }
+    Ok(SocksAuthRequestRead { credentials: c, next: at + 3 + ulen + plen })
+
+// The server's verdict and the offset after the message.  Zero is
+// success and every other value is failure.
+pub struct SocksAuthReplyRead
+    status: Int
+    next: Int
+
+// Append the server's verdict: VER 1 and STATUS.  The connection is
+// closed after any status but 0.
+pub fn encode_auth_reply(var out: [u8], status: Int) -> Result<Int, SocksError>
+    list.push(out, SOCKS_AUTH_VERSION as u8)
+    list.push(out, (status & 255) as u8)
+    Ok(2)
+
+// Read the server's verdict at `at`.
+pub fn decode_auth_reply(data: [u8], at: Int) -> Result<SocksAuthReplyRead, SocksError>
+    sockserr.require(data, at, 2)!
+    let v = data[at] as Int
+    if v != SOCKS_AUTH_VERSION
+        return Err(SocksBadAuthVersion(v))
+    Ok(SocksAuthReplyRead { status: data[at + 1] as Int, next: at + 2 })
+
+// ── Requests and replies (RFC 1928 sections 4 and 6) ────────────────
+
+// What a client asks for: a command, the destination and its port.
+pub struct SocksRequest
+    command: SocksCommand
+    address: SocksAddress
+    port: Int
+
+// A request and the offset after it.
+pub struct SocksRequestRead
+    request: SocksRequest
+    next: Int
+
+// What a server answers: the reply code and the address and port it
+// bound.  For CONNECT it is the address the server connected from, for
+// BIND it names the listening socket and then the peer, and for UDP
+// ASSOCIATE it is the relay the client sends datagrams to.
+pub struct SocksReplyMessage
+    reply: SocksReply
+    address: SocksAddress
+    port: Int
+
+// A reply and the offset after it.
+pub struct SocksReplyRead
+    message: SocksReplyMessage
+    next: Int
+
+// Append VER, CMD, RSV, ATYP, DST.ADDR and DST.PORT.
+pub fn encode_request(var out: [u8], r: SocksRequest) -> Result<Int, SocksError>
+    check_port(r.port)!
+    var tail: [u8] = []
+    let n = socksaddr.encode_address_into(var tail, r.address)!
+    list.push(out, SOCKS_VERSION as u8)
+    list.push(out, sockscode.command_code(r.command) as u8)
+    list.push(out, 0 as u8)
+    push_all(var out, tail)
+    push16(var out, r.port)
+    Ok(5 + n)
+
+// Read a request at `at`.  A command the RFC does not define is read,
+// not refused, so a server can answer it with "command not supported".
+pub fn decode_request(data: [u8], at: Int) -> Result<SocksRequestRead, SocksError>
+    sockserr.require(data, at, 4)!
+    check_version(data, at)!
+    let rsv = data[at + 2] as Int
+    if rsv != 0
+        return Err(SocksBadReserved(rsv))
+    let a = socksaddr.decode_address(data, at + 3)!
+    sockserr.require(data, a.next, 2)!
+    let req = SocksRequest { command: sockscode.command_of_code(data[at + 1] as Int),
+                             address: a.address, port: get16(data, a.next) }
+    Ok(SocksRequestRead { request: req, next: a.next + 2 })
+
+// Append VER, REP, RSV, ATYP, BND.ADDR and BND.PORT.
+pub fn encode_reply(var out: [u8], m: SocksReplyMessage) -> Result<Int, SocksError>
+    check_port(m.port)!
+    var tail: [u8] = []
+    let n = socksaddr.encode_address_into(var tail, m.address)!
+    list.push(out, SOCKS_VERSION as u8)
+    list.push(out, sockscode.reply_code(m.reply) as u8)
+    list.push(out, 0 as u8)
+    push_all(var out, tail)
+    push16(var out, m.port)
+    Ok(5 + n)
+
+// Read a reply at `at`.
+pub fn decode_reply(data: [u8], at: Int) -> Result<SocksReplyRead, SocksError>
+    sockserr.require(data, at, 4)!
+    check_version(data, at)!
+    let rsv = data[at + 2] as Int
+    if rsv != 0
+        return Err(SocksBadReserved(rsv))
+    let a = socksaddr.decode_address(data, at + 3)!
+    sockserr.require(data, a.next, 2)!
+    let m = SocksReplyMessage { reply: sockscode.reply_of_code(data[at + 1] as Int),
+                                address: a.address, port: get16(data, a.next) }
+    Ok(SocksReplyRead { message: m, next: a.next + 2 })
+
+// A reply that carries no address worth reading, as a server writes
+// when it refuses a request: the IPv4 address 0.0.0.0 and port 0.
+pub fn failure_reply(reply: SocksReply) -> SocksReplyMessage
+    SocksReplyMessage { reply: reply, address: socksaddr.ipv4(0, 0, 0, 0), port: 0 }
+
+// ── UDP datagrams (RFC 1928 section 7) ──────────────────────────────
+
+// The header in front of every datagram sent to or from a UDP relay.
+// `fragment` is 0 for a datagram that stands alone.
+pub struct SocksUdpHeader
+    fragment: Int
+    address: SocksAddress
+    port: Int
+
+// A UDP header and the offset where the datagram's data starts.
+pub struct SocksUdpRead
+    header: SocksUdpHeader
+    payload_at: Int
+
+// Append RSV, FRAG, ATYP, DST.ADDR and DST.PORT.  The caller appends
+// the datagram's data after it.
+pub fn encode_udp_header(var out: [u8], h: SocksUdpHeader) -> Result<Int, SocksError>
+    check_port(h.port)!
+    if h.fragment < 0 or h.fragment > 255
+        return Err(SocksFragmented(h.fragment))
+    var tail: [u8] = []
+    let n = socksaddr.encode_address_into(var tail, h.address)!
+    list.push(out, 0 as u8)
+    list.push(out, 0 as u8)
+    list.push(out, h.fragment as u8)
+    push_all(var out, tail)
+    push16(var out, h.port)
+    Ok(5 + n)
+
+// Read the header at the start of a datagram.  A reserved field that is
+// not zero is refused.  A fragment number other than 0 is read, so the
+// caller can see it, and `udp_is_standalone` tells it apart.
+pub fn decode_udp_header(data: [u8], at: Int) -> Result<SocksUdpRead, SocksError>
+    sockserr.require(data, at, 4)!
+    let rsv = get16(data, at)
+    if rsv != 0
+        return Err(SocksBadReserved(rsv))
+    let a = socksaddr.decode_address(data, at + 3)!
+    sockserr.require(data, a.next, 2)!
+    let h = SocksUdpHeader { fragment: data[at + 2] as Int, address: a.address,
+                             port: get16(data, a.next) }
+    Ok(SocksUdpRead { header: h, payload_at: a.next + 2 })
+
+// Whether a datagram is whole.  A relay that does not implement
+// fragmentation drops every datagram for which this is false.
+pub fn udp_is_standalone(h: SocksUdpHeader) -> Bool
+    h.fragment == 0

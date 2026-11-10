@@ -1,0 +1,158 @@
+// sockscode.nv — the numbers RFC 1928 and RFC 1929 assign: the
+// authentication methods, the three commands and the nine reply codes.
+//
+// Each number that a peer can send is a value with a name, and a number
+// the registry has not assigned is carried as it arrived, so a server
+// can answer "command not supported" to a command it has never heard of
+// instead of refusing to read the request.
+
+use std.str
+
+// ── Methods (RFC 1928 section 3, IANA registry) ─────────────────────
+
+// No authentication required.
+pub const SOCKS_METHOD_NONE = 0
+// GSS-API (RFC 1961).  Named so that a greeting can offer it; no
+// exchange for it is implemented here.
+pub const SOCKS_METHOD_GSSAPI = 1
+// Username and password (RFC 1929).
+pub const SOCKS_METHOD_PASSWORD = 2
+// The server's refusal of every method the client offered.
+pub const SOCKS_METHOD_NO_ACCEPTABLE = 255
+
+// The name of a method number, for a log line.
+pub fn method_name(method: Int) -> Str
+    if method == SOCKS_METHOD_NONE
+        "no authentication"
+    elif method == SOCKS_METHOD_GSSAPI
+        "GSS-API"
+    elif method == SOCKS_METHOD_PASSWORD
+        "username and password"
+    elif method == SOCKS_METHOD_NO_ACCEPTABLE
+        "no acceptable method"
+    elif method >= 3 and method <= 127
+        "IANA-assigned method " + str.from_int(method)
+    else
+        "private method " + str.from_int(method)
+
+// ── Commands (RFC 1928 section 4) ───────────────────────────────────
+
+// What a request asks the server to do.
+pub enum SocksCommand
+    // Open a TCP connection to the destination.
+    SocksConnect
+    // Listen for one inbound TCP connection from the destination.
+    SocksBind
+    // Open a UDP relay for datagrams to and from the destination.
+    SocksUdpAssociate
+    // A command number the RFC does not define, as it arrived.
+    SocksCommandOther(code: Int)
+
+// The command number that goes on the wire.
+pub fn command_code(c: SocksCommand) -> Int
+    match c
+        SocksConnect         => 1
+        SocksBind            => 2
+        SocksUdpAssociate    => 3
+        SocksCommandOther(n) => n
+
+// The command a number names.
+pub fn command_of_code(code: Int) -> SocksCommand
+    if code == 1
+        SocksConnect
+    elif code == 2
+        SocksBind
+    elif code == 3
+        SocksUdpAssociate
+    else
+        SocksCommandOther(code)
+
+// The RFC's name for a command.
+pub fn command_name(c: SocksCommand) -> Str
+    match c
+        SocksConnect         => "CONNECT"
+        SocksBind            => "BIND"
+        SocksUdpAssociate    => "UDP ASSOCIATE"
+        SocksCommandOther(n) => "command " + str.from_int(n)
+
+// ── Reply codes (RFC 1928 section 6) ────────────────────────────────
+
+// The REP field of a reply.
+pub enum SocksReply
+    // 0: succeeded.
+    SocksReplySucceeded
+    // 1: general SOCKS server failure.
+    SocksReplyGeneralFailure
+    // 2: connection not allowed by ruleset.
+    SocksReplyNotAllowed
+    // 3: network unreachable.
+    SocksReplyNetworkUnreachable
+    // 4: host unreachable.
+    SocksReplyHostUnreachable
+    // 5: connection refused.
+    SocksReplyConnectionRefused
+    // 6: TTL expired.
+    SocksReplyTtlExpired
+    // 7: command not supported.
+    SocksReplyCommandNotSupported
+    // 8: address type not supported.
+    SocksReplyAddressTypeNotSupported
+    // 9 to 255: unassigned, as it arrived.
+    SocksReplyUnassigned(code: Int)
+
+// The reply number that goes on the wire.
+pub fn reply_code(r: SocksReply) -> Int
+    match r
+        SocksReplySucceeded               => 0
+        SocksReplyGeneralFailure          => 1
+        SocksReplyNotAllowed              => 2
+        SocksReplyNetworkUnreachable      => 3
+        SocksReplyHostUnreachable         => 4
+        SocksReplyConnectionRefused       => 5
+        SocksReplyTtlExpired              => 6
+        SocksReplyCommandNotSupported     => 7
+        SocksReplyAddressTypeNotSupported => 8
+        SocksReplyUnassigned(n)           => n
+
+// The reply a number names.
+pub fn reply_of_code(code: Int) -> SocksReply
+    if code == 0
+        SocksReplySucceeded
+    elif code == 1
+        SocksReplyGeneralFailure
+    elif code == 2
+        SocksReplyNotAllowed
+    elif code == 3
+        SocksReplyNetworkUnreachable
+    elif code == 4
+        SocksReplyHostUnreachable
+    elif code == 5
+        SocksReplyConnectionRefused
+    elif code == 6
+        SocksReplyTtlExpired
+    elif code == 7
+        SocksReplyCommandNotSupported
+    elif code == 8
+        SocksReplyAddressTypeNotSupported
+    else
+        SocksReplyUnassigned(code)
+
+// The RFC's words for a reply.
+pub fn reply_name(r: SocksReply) -> Str
+    match r
+        SocksReplySucceeded               => "succeeded"
+        SocksReplyGeneralFailure          => "general SOCKS server failure"
+        SocksReplyNotAllowed              => "connection not allowed by ruleset"
+        SocksReplyNetworkUnreachable      => "network unreachable"
+        SocksReplyHostUnreachable         => "host unreachable"
+        SocksReplyConnectionRefused       => "connection refused"
+        SocksReplyTtlExpired              => "TTL expired"
+        SocksReplyCommandNotSupported     => "command not supported"
+        SocksReplyAddressTypeNotSupported => "address type not supported"
+        SocksReplyUnassigned(n)           => "unassigned reply " + str.from_int(n)
+
+// Whether a reply reports success.
+pub fn reply_is_success(r: SocksReply) -> Bool
+    match r
+        SocksReplySucceeded => true
+        _                   => false

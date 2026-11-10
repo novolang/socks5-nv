@@ -1,0 +1,471 @@
+// socks_machine_tests.nv — the client and the server driven with bytes,
+// whole exchanges and the faults inside them.  No test opens a socket:
+// the bytes one side writes are the bytes the test hands the other.
+
+use std.test
+use std.bytes
+use sockscode
+use socksaddr
+use sockswire
+use socksclient
+use socksserver
+
+fn h(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(s) ?? bytes.zeros(0))
+
+// Two byte strings, one after the other.
+fn cat(a: [u8], b: [u8]) -> [u8]
+    var out: [u8] = []
+    for x in a
+        list.push(out, x)
+    for x in b
+        list.push(out, x)
+    out
+
+// A CONNECT to example.com:80 with no authentication offered.
+fn connect_config() -> SocksClientConfig
+    socksclient.client_config(SocksConnect, SocksAddrDomain("example.com"), 80)
+
+// The request that configuration writes.
+fn connect_request_bytes() -> [u8]
+    h("05010003" + "0b" + "6578616d706c652e636f6d" + "0050")
+
+// A successful reply bound to 127.0.0.1:8080.
+fn ok_reply() -> [u8]
+    h("05000001" + "7f000001" + "1f90")
+
+// The client after `client_start`.
+fn started(c: SocksClientConfig) -> SocksClientStep
+    match socksclient.client_start(c)
+        Ok(step) => step
+        Err(_)   => core.panic.panic("the configuration is refused")
+
+// How the first event of a client step reads, as a word.
+fn word(step: SocksClientStep) -> Str
+    if list.len(step.events) == 0
+        return "none"
+    match step.events[0]
+        SocksClientListening(_)      => "listening"
+        SocksClientEstablished(_, _) => "established"
+        SocksClientRefused(_)        => "refused"
+        SocksClientFailed(e)         => "failed: " + e.message()
+
+fn sword(step: SocksServerStep) -> Str
+    if list.len(step.events) == 0
+        return "none"
+    match step.events[0]
+        SocksServerCredentialsRead(_) => "credentials"
+        SocksServerRequestRead(_)     => "request"
+        SocksServerFailed(e)          => "failed: " + e.message()
+
+fn start_error(c: SocksClientConfig) -> Str
+    match socksclient.client_start(c)
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+@test
+fn test_a_connect_with_no_authentication() [io]
+    let s0 = started(connect_config())
+    test.assert_eq(s0.output, h("050100"))
+    test.assert_eq(word(s0), "none")
+
+    test.case("the server picks method 0 and the request goes out")
+    let s1 = socksclient.client_feed(s0.client, h("0500"))
+    test.assert_eq(s1.output, connect_request_bytes())
+    test.assert_eq(word(s1), "none")
+    test.assert(not socksclient.client_is_done(s1.client))
+
+    test.case("the reply opens the connection, and what followed it is the tunnel's")
+    let s2 = socksclient.client_feed(s1.client, cat(ok_reply(), h("6869")))
+    match s2.events[0]
+        SocksClientEstablished(m, leftover) =>
+            test.assert_eq(m.port, 8080)
+            test.assert_eq(leftover, h("6869"))
+        _                                   => test.fail("a successful reply establishes the connection")
+    test.assert(socksclient.client_is_established(s2.client))
+    test.assert(socksclient.client_is_done(s2.client))
+
+    test.case("bytes after that are not part of the exchange")
+    let s3 = socksclient.client_feed(s2.client, h("00"))
+    test.assert_eq(word(s3), "failed: the call is not valid in the state the exchange is in")
+    test.assert(socksclient.client_is_established(s3.client))
+
+@test
+fn test_the_client_reads_one_byte_at_a_time() [io]
+    // A whole exchange fed a byte at a time gives the events it gives
+    // fed whole: the machine keeps the partial message.
+    var step = started(connect_config())
+    var wrote: [u8] = []
+    var established = 0
+    let server_bytes = cat(h("0500"), ok_reply())
+    for b in server_bytes
+        step = socksclient.client_feed(step.client, [b])
+        for x in step.output
+            list.push(wrote, x)
+        if word(step) == "established"
+            established = established + 1
+    test.assert_eq(established, 1)
+    test.assert_eq(wrote, connect_request_bytes())
+
+@test
+fn test_a_connect_with_a_password() [io]
+    let cfg = socksclient.client_with_credentials(connect_config(), "user", "pass")
+    let s0 = started(cfg)
+    test.assert_eq(s0.output, h("05020002"))
+
+    test.case("method 2 sends the credentials, and success sends the request")
+    let s1 = socksclient.client_feed(s0.client, h("0502"))
+    test.assert_eq(s1.output, h("0104757365720470617373"))
+    let s2 = socksclient.client_feed(s1.client, h("0100"))
+    test.assert_eq(s2.output, connect_request_bytes())
+    let s3 = socksclient.client_feed(s2.client, ok_reply())
+    test.assert_eq(word(s3), "established")
+
+    test.case("the server may still choose method 0")
+    let t1 = socksclient.client_feed(s0.client, h("0500"))
+    test.assert_eq(t1.output, connect_request_bytes())
+
+    test.case("a verdict other than 0 ends the exchange")
+    let r2 = socksclient.client_feed(s1.client, h("0101"))
+    test.assert_eq(word(r2), "failed: the server rejected the user name and password with status 1")
+    test.assert(socksclient.client_is_done(r2.client))
+    test.assert(not socksclient.client_is_established(r2.client))
+
+    test.case("a verdict with the wrong version, and a verdict cut short")
+    test.assert_eq(word(socksclient.client_feed(s1.client, h("0500"))),
+        "failed: the authentication version byte is 5 and RFC 1929 is 1")
+    test.assert_eq(word(socksclient.client_feed(s1.client, h("01"))), "none")
+
+@test
+fn test_the_client_reports_what_the_server_refuses_or_gets_wrong() [io]
+    let s0 = started(connect_config())
+
+    test.case("method 255 is a refusal of every method")
+    test.assert_eq(word(socksclient.client_feed(s0.client, h("05ff"))),
+        "failed: the server accepts none of the offered methods")
+
+    test.case("a method that was not offered")
+    test.assert_eq(word(socksclient.client_feed(s0.client, h("0502"))),
+        "failed: the server chose method 2, which was not offered")
+
+    test.case("a method that was offered and has no exchange here")
+    let gss = started(socksclient.client_with_methods(connect_config(), [1]))
+    test.assert_eq(word(socksclient.client_feed(gss.client, h("0501"))),
+        "failed: the server accepts none of the offered methods")
+
+    test.case("a wrong version")
+    test.assert_eq(word(socksclient.client_feed(s0.client, h("0400"))),
+        "failed: the version byte is 4 and SOCKS5 is 5")
+
+    test.case("a reply other than success")
+    let s1 = socksclient.client_feed(s0.client, h("0500"))
+    let refused = socksclient.client_feed(s1.client, h("05050001" + "00000000" + "0000"))
+    test.assert_eq(word(refused), "refused")
+    match refused.events[0]
+        SocksClientRefused(m) => test.assert_eq(sockscode.reply_name(m.reply), "connection refused")
+        _                     => test.fail("the refusal carries the reply")
+    test.assert(socksclient.client_is_done(refused.client))
+
+    test.case("a reply with a fault in it")
+    test.assert_eq(word(socksclient.client_feed(s1.client, h("05000501" + "00000000" + "0000"))),
+        "failed: the reserved byte is 5 and must be 0")
+
+    test.case("a reply cut short waits")
+    let half = socksclient.client_feed(s1.client, h("050000"))
+    test.assert_eq(word(half), "none")
+    test.assert_eq(list.len(half.client.pending), 3)
+
+@test
+fn test_the_configuration_is_checked_before_anything_is_sent() [io]
+    test.assert_eq(start_error(socksclient.client_config(SocksConnect, socksaddr.ipv4(1, 2, 3, 4), 70000)),
+        "port 70000 is not 0 to 65535")
+    test.assert_eq(start_error(socksclient.client_config(SocksConnect, SocksAddrDomain(""), 80)),
+        "a domain name of 0 bytes is not 1 to 255")
+    test.assert_eq(start_error(socksclient.client_with_credentials(connect_config(), "", "")),
+        "user name and password were chosen and none were configured")
+    test.assert_eq(start_error(socksclient.client_with_methods(connect_config(), [])),
+        "a greeting of 0 methods is not 1 to 255")
+    test.assert_eq(start_error(connect_config()), "ok")
+
+@test
+fn test_a_bind_has_two_replies() [io]
+    let cfg = socksclient.client_config(SocksBind, socksaddr.ipv4(10, 0, 0, 9), 0)
+    let s0 = started(cfg)
+    let s1 = socksclient.client_feed(s0.client, h("0500"))
+
+    test.case("the first reply says where the server listens")
+    let s2 = socksclient.client_feed(s1.client, ok_reply())
+    test.assert_eq(word(s2), "listening")
+    test.assert(not socksclient.client_is_done(s2.client))
+
+    test.case("the second says who connected")
+    let s3 = socksclient.client_feed(s2.client, h("05000001" + "0a000009" + "d431"))
+    match s3.events[0]
+        SocksClientEstablished(m, _) => test.assert_eq(socksaddr.address_text(m.address), "10.0.0.9")
+        _                            => test.fail("the second reply establishes the connection")
+
+    test.case("both in one read give both events, in order")
+    let both = socksclient.client_feed(s1.client, cat(ok_reply(), h("05000001" + "0a000009" + "d431")))
+    test.assert_eq(list.len(both.events), 2)
+    test.assert_eq(word(both), "listening")
+    match both.events[1]
+        SocksClientEstablished(_, _) => test.assert(true)
+        _                            => test.fail("the second event is the connection")
+
+    test.case("the second reply may be a refusal")
+    let no = socksclient.client_feed(s2.client, h("05060001" + "00000000" + "0000"))
+    test.assert_eq(word(no), "refused")
+
+@test
+fn test_udp_associate_answers_the_relay() [io]
+    let cfg = socksclient.client_config(SocksUdpAssociate, socksaddr.ipv4(0, 0, 0, 0), 0)
+    let s1 = socksclient.client_feed(started(cfg).client, h("0500"))
+    test.assert_eq(s1.output, h("05030001" + "00000000" + "0000"))
+    let s2 = socksclient.client_feed(s1.client, h("05000001" + "c0a80001" + "2710"))
+    match s2.events[0]
+        SocksClientEstablished(m, _) =>
+            test.assert_eq(socksaddr.address_text(m.address), "192.168.0.1")
+            test.assert_eq(m.port, 10000)
+        _                            => test.fail("the reply names the relay")
+
+// ── The server ──────────────────────────────────────────────────────
+
+fn no_auth_server() -> SocksServer
+    socksserver.server_start(socksserver.server_config([0]))
+
+fn password_server() -> SocksServer
+    socksserver.server_start(socksserver.server_config([2]))
+
+@test
+fn test_a_server_takes_a_connect_and_answers_it() [io]
+    let s0 = no_auth_server()
+    test.assert(not socksserver.server_is_done(s0))
+
+    test.case("the greeting is answered with the method")
+    let s1 = socksserver.server_feed(s0, h("050100"))
+    test.assert_eq(s1.output, h("0500"))
+    test.assert_eq(sword(s1), "none")
+
+    test.case("the request is handed to the caller")
+    let s2 = socksserver.server_feed(s1.server, connect_request_bytes())
+    test.assert_eq(sword(s2), "request")
+    match s2.events[0]
+        SocksServerRequestRead(r) =>
+            test.assert_eq(socksaddr.address_text(r.address), "example.com")
+            test.assert_eq(r.port, 80)
+        _                         => test.fail("the request is read")
+
+    test.case("bytes that arrive while the caller works are kept")
+    let s3 = socksserver.server_feed(s2.server, h("4142"))
+    test.assert_eq(sword(s3), "none")
+    test.assert_eq(s3.server.pending, h("4142"))
+
+    test.case("the caller's reply is written, and the connection opens")
+    let ok = SocksReplyMessage { reply: SocksReplySucceeded,
+        address: socksaddr.ipv4(127, 0, 0, 1),
+        port: 8080 }
+    let s4 = socksserver.server_reply(s3.server, ok)
+    test.assert_eq(s4.output, ok_reply())
+    test.assert(socksserver.server_is_open(s4.server))
+    test.assert_eq(s4.server.pending, h("4142"))
+
+    test.case("after that the machine reads nothing")
+    test.assert_eq(sword(socksserver.server_feed(s4.server, h("00"))),
+        "failed: the call is not valid in the state the exchange is in")
+
+@test
+fn test_a_server_reads_a_greeting_and_a_request_from_one_read() [io]
+    let s1 = socksserver.server_feed(no_auth_server(), cat(cat(h("050100"), connect_request_bytes()), h("99")))
+    test.assert_eq(s1.output, h("0500"))
+    test.assert_eq(sword(s1), "request")
+    test.assert_eq(s1.server.pending, h("99"))
+
+    test.case("a byte at a time gives the same request")
+    var s = no_auth_server()
+    var seen = 0
+    for b in cat(h("050100"), connect_request_bytes())
+        let step = socksserver.server_feed(s, [b])
+        s = step.server
+        if sword(step) == "request"
+            seen = seen + 1
+    test.assert_eq(seen, 1)
+
+@test
+fn test_a_server_that_requires_a_password() [io]
+    let greeting = h("05020002")
+    let s1 = socksserver.server_feed(password_server(), greeting)
+    test.assert_eq(s1.output, h("0502"))
+
+    test.case("the credentials go to the caller")
+    let s2 = socksserver.server_feed(s1.server, h("0104757365720470617373"))
+    match s2.events[0]
+        SocksServerCredentialsRead(c) =>
+            test.assert_eq(c.username, "user")
+            test.assert_eq(c.password, "pass")
+        _                             => test.fail("the credentials are read")
+
+    test.case("acceptance writes status 0 and goes on to the request")
+    let s3 = socksserver.server_authenticate(s2.server, true)
+    test.assert_eq(s3.output, h("0100"))
+    let s4 = socksserver.server_feed(s3.server, connect_request_bytes())
+    test.assert_eq(sword(s4), "request")
+
+    test.case("a request that arrived with the credentials is read on acceptance")
+    let piped = socksserver.server_feed(s1.server, cat(h("0104757365720470617373"), connect_request_bytes()))
+    test.assert_eq(sword(piped), "credentials")
+    let after = socksserver.server_authenticate(piped.server, true)
+    test.assert_eq(after.output, h("0100"))
+    test.assert_eq(sword(after), "request")
+
+    test.case("rejection writes status 1 and ends the exchange")
+    let s5 = socksserver.server_authenticate(s2.server, false)
+    test.assert_eq(s5.output, h("0101"))
+    test.assert(socksserver.server_is_done(s5.server))
+    test.assert(not socksserver.server_is_open(s5.server))
+
+    test.case("a client that does not offer method 2 is refused")
+    let s6 = socksserver.server_feed(password_server(), h("050100"))
+    test.assert_eq(s6.output, h("05ff"))
+    test.assert_eq(sword(s6), "failed: the server accepts none of the offered methods")
+
+    test.case("the server's order decides when the client offers both")
+    let both = socksserver.server_start(socksserver.server_config([2, 0]))
+    test.assert_eq(socksserver.server_feed(both, h("05020002")).output, h("0502"))
+    let other = socksserver.server_start(socksserver.server_config([0, 2]))
+    test.assert_eq(socksserver.server_feed(other, h("05020002")).output, h("0500"))
+
+    test.case("a method with no exchange here is never chosen")
+    let gss = socksserver.server_start(socksserver.server_config([1]))
+    test.assert_eq(socksserver.server_feed(gss, h("05020001")).output, h("05ff"))
+
+    test.case("a method the server does not list is never chosen")
+    test.assert_eq(sword(socksserver.server_feed(no_auth_server(), h("050101"))),
+        "failed: the server accepts none of the offered methods")
+
+@test
+fn test_a_server_refuses_what_it_cannot_carry_out() [io]
+    let s1 = socksserver.server_feed(no_auth_server(), h("050100"))
+
+    test.case("an address type it cannot read is answered with reply 8")
+    let bad_atyp = socksserver.server_feed(s1.server, h("0501000900000000" + "0050"))
+    test.assert_eq(bad_atyp.output, h("05080001" + "00000000" + "0000"))
+    test.assert_eq(sword(bad_atyp), "failed: address type 9 is not 1, 3 or 4")
+    test.assert(socksserver.server_is_done(bad_atyp.server))
+
+    test.case("a command RFC 1928 does not define is answered with reply 7")
+    let bad_cmd = socksserver.server_feed(s1.server, h("0509000100000000" + "0050"))
+    test.assert_eq(bad_cmd.output, h("05070001" + "00000000" + "0000"))
+    test.assert_eq(sword(bad_cmd), "failed: command 9 is not defined by RFC 1928")
+
+    test.case("any other fault in the request ends the exchange without a reply")
+    let bad_rsv = socksserver.server_feed(s1.server, h("0501070100000000" + "0050"))
+    test.assert_eq(list.len(bad_rsv.output), 0)
+    test.assert_eq(sword(bad_rsv), "failed: the reserved byte is 7 and must be 0")
+
+    test.case("faults in the greeting and in the credentials")
+    test.assert_eq(sword(socksserver.server_feed(no_auth_server(), h("0401" + "00"))),
+        "failed: the version byte is 4 and SOCKS5 is 5")
+    let s2 = socksserver.server_feed(password_server(), h("05020002"))
+    test.assert_eq(sword(socksserver.server_feed(s2.server, h("0200"))),
+        "failed: the authentication version byte is 2 and RFC 1929 is 1")
+
+    test.case("a reply the server cannot write changes nothing")
+    let asked = socksserver.server_feed(s1.server, connect_request_bytes())
+    let bad_port = SocksReplyMessage { reply: SocksReplySucceeded,
+        address: socksaddr.ipv4(1, 1, 1, 1),
+        port: 99999 }
+    let kept = socksserver.server_reply(asked.server, bad_port)
+    test.assert_eq(list.len(kept.output), 0)
+    test.assert_eq(sword(kept), "failed: port 99999 is not 0 to 65535")
+    test.assert(not socksserver.server_is_done(kept.server))
+
+    test.case("a failure reply ends the exchange")
+    let no = socksserver.server_reply(asked.server, sockswire.failure_reply(SocksReplyHostUnreachable))
+    test.assert_eq(no.output, h("05040001" + "00000000" + "0000"))
+    test.assert(socksserver.server_is_done(no.server))
+    test.assert(not socksserver.server_is_open(no.server))
+
+@test
+fn test_a_server_answers_a_bind_twice() [io]
+    let s1 = socksserver.server_feed(no_auth_server(), h("050100"))
+    let asked = socksserver.server_feed(s1.server, h("05020001" + "0a000009" + "0000"))
+    test.assert_eq(sword(asked), "request")
+    let listening = SocksReplyMessage { reply: SocksReplySucceeded,
+        address: socksaddr.ipv4(10, 0, 0, 1),
+        port: 4000 }
+    let first = socksserver.server_reply(asked.server, listening)
+    test.assert(not socksserver.server_is_done(first.server))
+    let peer = SocksReplyMessage { reply: SocksReplySucceeded,
+        address: socksaddr.ipv4(10, 0, 0, 9),
+        port: 54321 }
+    let second = socksserver.server_reply(first.server, peer)
+    test.assert_eq(second.output, h("05000001" + "0a000009" + "d431"))
+    test.assert(socksserver.server_is_open(second.server))
+
+    test.case("a failure instead of the peer ends it")
+    let failed = socksserver.server_reply(first.server, sockswire.failure_reply(SocksReplyGeneralFailure))
+    test.assert(socksserver.server_is_done(failed.server))
+
+@test
+fn test_calls_out_of_turn_are_wrong_state() [io]
+    let fresh = no_auth_server()
+    let a = socksserver.server_authenticate(fresh, true)
+    test.assert_eq(sword(a), "failed: the call is not valid in the state the exchange is in")
+    let r = socksserver.server_reply(fresh, sockswire.failure_reply(SocksReplySucceeded))
+    test.assert_eq(sword(r), "failed: the call is not valid in the state the exchange is in")
+
+    test.case("bytes while the server waits for the caller's verdict are kept")
+    let s1 = socksserver.server_feed(password_server(), h("05020002"))
+    let s2 = socksserver.server_feed(s1.server, h("0104757365720470617373"))
+    let s3 = socksserver.server_feed(s2.server, h("05"))
+    test.assert_eq(sword(s3), "none")
+    test.assert_eq(s3.server.pending, h("05"))
+
+@test
+fn test_a_client_and_a_server_talk_to_each_other() [io]
+    // Each side's output is the other's input, until neither has any.
+    var c = started(socksclient.client_with_credentials(connect_config(), "alice", "s3cret"))
+    var s = socksserver.server_start(socksserver.server_config([2]))
+    var to_server = c.output[:]
+    var to_client: [u8] = []
+    var asked = false
+    var checked = ""
+    var open = false
+    for _ in 0..6
+        if list.len(to_server) > 0
+            let step = socksserver.server_feed(s, to_server)
+            s = step.server
+            to_server = []
+            for x in step.output
+                list.push(to_client, x)
+            for ev in step.events
+                match ev
+                    SocksServerCredentialsRead(creds) =>
+                        checked = creds.username + "/" + creds.password
+                        let a = socksserver.server_authenticate(s, creds.password == "s3cret")
+                        s = a.server
+                        for x in a.output
+                            list.push(to_client, x)
+                    SocksServerRequestRead(req)       =>
+                        asked = true
+                        let ok = SocksReplyMessage { reply: SocksReplySucceeded,
+                            address: socksaddr.ipv4(10, 1, 1, 1),
+                            port: 40000 }
+                        let r = socksserver.server_reply(s, ok)
+                        s = r.server
+                        for x in r.output
+                            list.push(to_client, x)
+                    SocksServerFailed(_)              => test.fail("no fault in this exchange")
+        if list.len(to_client) > 0
+            let step = socksclient.client_feed(c.client, to_client)
+            c = SocksClientStep { client: step.client, output: [], events: [] }
+            to_client = []
+            for x in step.output
+                list.push(to_server, x)
+            if word(step) == "established"
+                open = true
+    test.assert_eq(checked, "alice/s3cret")
+    test.assert(asked)
+    test.assert(open)
+    test.assert(socksclient.client_is_established(c.client))
+    test.assert(socksserver.server_is_open(s))

@@ -1,0 +1,404 @@
+// socks_wire_tests.nv — the messages of RFC 1928 and RFC 1929, written
+// out byte by byte.  Each vector is spelled in hexadecimal with the
+// fields of the RFC's own diagram named beside it.
+
+use std.test
+use std.bytes
+use std.str
+use sockscode
+use socksaddr
+use sockserr
+use sockswire
+
+// The bytes of a hexadecimal string.
+fn h(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(s) ?? bytes.zeros(0))
+
+// The text of the error a result carries, or "ok".
+fn why(r: Result<Int, SocksError>) -> Str
+    match r
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+// The number of bytes an encoder reports, or -1 for a refusal.
+fn wrote(r: Result<Int, SocksError>) -> Int
+    match r
+        Ok(n)  => n
+        Err(_) => -1
+
+// Whether the result is an error whose words begin with `prefix`.
+fn says(r: Result<Int, SocksError>, prefix: Str) -> Bool
+    str.starts_with(why(r), prefix)
+
+@test
+fn test_the_greeting_is_version_count_and_methods() [io]
+    // RFC 1928 section 3: VER 05, NMETHODS 02, METHODS 00 02.
+    var out: [u8] = []
+    test.assert_eq(wrote(sockswire.encode_greeting(var out, [0, 2])), 4)
+    test.assert_eq(out, h("05020002"))
+
+    test.case("a greeting reads back")
+    match sockswire.decode_greeting(h("05020002ff"), 0)
+        Ok(g)  =>
+            test.assert_eq(g.methods, [0, 2])
+            test.assert_eq(g.next, 4)
+        Err(_) => test.fail("a greeting of two methods is readable")
+
+    test.case("a greeting is read at an offset")
+    match sockswire.decode_greeting(h("aa0501ff"), 1)
+        Ok(g)  =>
+            test.assert_eq(g.methods, [255])
+            test.assert_eq(g.next, 4)
+        Err(_) => test.fail("the offset is honoured")
+
+    test.case("no method, too many methods and a method that is not a byte")
+    var scratch: [u8] = []
+    test.assert(says(sockswire.encode_greeting(var scratch, []), "a greeting of 0"))
+    var many: [Int] = []
+    for _ in 0..256
+        list.push(many, 0)
+    test.assert(says(sockswire.encode_greeting(var scratch, many), "a greeting of 256"))
+    test.assert(says(sockswire.encode_greeting(var scratch, [300]), "method 300"))
+    test.assert_eq(list.len(scratch), 0)
+
+    test.case("a short greeting is incomplete, and says how short")
+    match sockswire.decode_greeting(h("0502"), 0)
+        Err(SocksTruncated(need, have)) =>
+            test.assert_eq(need, 4)
+            test.assert_eq(have, 2)
+        _                               => test.fail("two methods are announced and none are there")
+    match sockswire.decode_greeting(h("05"), 0)
+        Err(SocksTruncated(need, have)) => test.assert_eq(need, 2)
+        _                               => test.fail("one byte is not a greeting")
+
+    test.case("the version and the count are checked")
+    match sockswire.decode_greeting(h("040100"), 0)
+        Err(SocksBadVersion(got)) => test.assert_eq(got, 4)
+        _                         => test.fail("SOCKS4 is not SOCKS5")
+    match sockswire.decode_greeting(h("0500"), 0)
+        Err(SocksBadMethodCount(count)) => test.assert_eq(count, 0)
+        _                               => test.fail("a greeting offers at least one method")
+
+@test
+fn test_the_method_selection_is_version_and_method() [io]
+    var out: [u8] = []
+    test.assert_eq(wrote(sockswire.encode_method_selection(var out, 2)), 2)
+    test.assert_eq(out, h("0502"))
+    test.assert(says(sockswire.encode_method_selection(var out, 256), "method 256"))
+    test.assert(says(sockswire.encode_method_selection(var out, -1), "method -1"))
+
+    test.case("it reads back, including the refusal")
+    match sockswire.decode_method_selection(h("05ff"), 0)
+        Ok(m)  =>
+            test.assert_eq(m.method, 255)
+            test.assert_eq(m.next, 2)
+        Err(_) => test.fail("05 ff is the refusal of RFC 1928 section 3")
+
+    test.case("a wrong version and a short message")
+    match sockswire.decode_method_selection(h("0500"), 1)
+        Err(SocksTruncated(_, have)) => test.assert_eq(have, 1)
+        _                            => test.fail("one byte left at the offset")
+    match sockswire.decode_method_selection(h("0100"), 0)
+        Err(SocksBadVersion(got)) => test.assert_eq(got, 1)
+        _                         => test.fail("version 1 is not SOCKS5")
+
+@test
+fn test_username_and_password_follow_rfc_1929() [io]
+    // RFC 1929 section 2: VER 01, ULEN 04, "user", PLEN 04, "pass".
+    let creds = SocksCredentials { username: "user", password: "pass" }
+    var out: [u8] = []
+    test.assert_eq(wrote(sockswire.encode_auth_request(var out, creds)), 11)
+    test.assert_eq(out, h("01047573657204706173" + "73"))
+
+    test.case("it reads back")
+    match sockswire.decode_auth_request(out, 0)
+        Ok(r)  =>
+            test.assert_eq(r.credentials.username, "user")
+            test.assert_eq(r.credentials.password, "pass")
+            test.assert_eq(r.next, 11)
+        Err(_) => test.fail("the request written is readable")
+
+    test.case("an empty or oversized field is refused when written")
+    var scratch: [u8] = []
+    test.assert(says(sockswire.encode_auth_request(var scratch, SocksCredentials { username: "", password: "x" }),
+        "a user name or password of 0"))
+    test.assert(says(sockswire.encode_auth_request(var scratch, SocksCredentials { username: "x", password: "" }),
+        "a user name or password of 0"))
+    test.assert_eq(list.len(scratch), 0)
+
+    test.case("and when read")
+    match sockswire.decode_auth_request(h("0100"), 0)
+        Err(SocksBadCredential(n)) => test.assert_eq(n, 0)
+        _                          => test.fail("ULEN 0 is refused")
+    match sockswire.decode_auth_request(h("010161" + "00"), 0)
+        Err(SocksBadCredential(n)) => test.assert_eq(n, 0)
+        _                          => test.fail("PLEN 0 is refused")
+    match sockswire.decode_auth_request(h("0201" + "6101" + "62"), 0)
+        Err(SocksBadAuthVersion(got)) => test.assert_eq(got, 2)
+        _                             => test.fail("the sub-negotiation version is 1")
+
+    test.case("a request cut short is incomplete at every length")
+    for n in 1..11
+        match sockswire.decode_auth_request(out[0:n], 0)
+            Err(e) => test.assert(sockserr.is_incomplete(e))
+            Ok(_)  => test.fail("a prefix of a request is not a request")
+
+    test.case("the reply is VER 01 and STATUS")
+    var reply: [u8] = []
+    test.assert_eq(wrote(sockswire.encode_auth_reply(var reply, 0)), 2)
+    test.assert_eq(reply, h("0100"))
+    match sockswire.decode_auth_reply(h("0101"), 0)
+        Ok(r)  =>
+            test.assert_eq(r.status, 1)
+            test.assert_eq(r.next, 2)
+        Err(_) => test.fail("a failure status is readable")
+    match sockswire.decode_auth_reply(h("0500"), 0)
+        Err(SocksBadAuthVersion(got)) => test.assert_eq(got, 5)
+        _                             => test.fail("version 5 is not the sub-negotiation")
+    match sockswire.decode_auth_reply(h("01"), 0)
+        Err(SocksTruncated(_, _)) => test.assert(true)
+        _                         => test.fail("one byte is incomplete")
+
+@test
+fn test_a_connect_request_to_each_address_form() [io]
+    test.case("IPv4: CONNECT 93.184.216.34:80")
+    // VER 05, CMD 01, RSV 00, ATYP 01, ADDR 5d b8 d8 22, PORT 00 50.
+    var out: [u8] = []
+    let req4 = SocksRequest { command: SocksConnect, address: socksaddr.ipv4(93, 184, 216, 34), port: 80 }
+    test.assert_eq(wrote(sockswire.encode_request(var out, req4)), 10)
+    test.assert_eq(out, h("050100015db8d8220050"))
+    match sockswire.decode_request(out, 0)
+        Ok(r)  =>
+            test.assert_eq(r.request.port, 80)
+            test.assert_eq(socksaddr.address_text(r.request.address), "93.184.216.34")
+            test.assert_eq(r.next, 10)
+        Err(_) => test.fail("the request written is readable")
+
+    test.case("domain: CONNECT example.com:443")
+    var out2: [u8] = []
+    let req3 = SocksRequest { command: SocksConnect, address: SocksAddrDomain("example.com"), port: 443 }
+    test.assert_eq(wrote(sockswire.encode_request(var out2, req3)), 18)
+    test.assert_eq(out2, h("05010003" + "0b" + "6578616d706c652e636f6d" + "01bb"))
+    match sockswire.decode_request(out2, 0)
+        Ok(r)  =>
+            test.assert_eq(socksaddr.address_text(r.request.address), "example.com")
+            test.assert_eq(r.request.port, 443)
+        Err(_) => test.fail("a domain request is readable")
+
+    test.case("IPv6: CONNECT [2001:db8::1]:8080")
+    var out6: [u8] = []
+    let a6 = socksaddr.ipv6(h("20010db8000000000000000000000001"))
+    match a6
+        Err(_)   => test.fail("sixteen octets are an address")
+        Ok(addr) =>
+            let req6 = SocksRequest { command: SocksConnect, address: addr, port: 8080 }
+            test.assert_eq(wrote(sockswire.encode_request(var out6, req6)), 22)
+            test.assert_eq(out6, h("05010004" + "20010db8000000000000000000000001" + "1f90"))
+            match sockswire.decode_request(out6, 0)
+                Ok(r)  => test.assert_eq(socksaddr.address_text(r.request.address), "2001:db8::1")
+                Err(_) => test.fail("an IPv6 request is readable")
+
+    test.case("BIND and UDP ASSOCIATE carry their command numbers")
+    var b: [u8] = []
+    let _w = sockswire.encode_request(var b, SocksRequest { command: SocksBind, address: socksaddr.ipv4(0, 0, 0, 0), port: 0 })
+    test.assert_eq(b[1], 2 as u8)
+    var u: [u8] = []
+    let _x = sockswire.encode_request(var u,
+        SocksRequest { command: SocksUdpAssociate, address: socksaddr.ipv4(0, 0, 0, 0), port: 0 })
+    test.assert_eq(u[1], 3 as u8)
+
+    test.case("a command the RFC does not define is read, not refused")
+    match sockswire.decode_request(h("0509000100000000" + "0000"), 0)
+        Ok(r)  =>
+            match r.request.command
+                SocksCommandOther(code) => test.assert_eq(code, 9)
+                _                       => test.fail("command 9 is carried as it arrived")
+        Err(_) => test.fail("a server must be able to refuse command 9 by name")
+
+@test
+fn test_a_request_is_refused_for_each_fault() [io]
+    test.case("a version, a reserved byte and an address type")
+    match sockswire.decode_request(h("0401000100000000" + "0050"), 0)
+        Err(SocksBadVersion(got)) => test.assert_eq(got, 4)
+        _                         => test.fail("the version is checked")
+    match sockswire.decode_request(h("0501070100000000" + "0050"), 0)
+        Err(SocksBadReserved(got)) => test.assert_eq(got, 7)
+        _                          => test.fail("RSV must be zero")
+    match sockswire.decode_request(h("0501000900000000" + "0050"), 0)
+        Err(SocksBadAddressType(got)) => test.assert_eq(got, 9)
+        _                             => test.fail("ATYP 9 is not an address")
+
+    test.case("an empty domain")
+    match sockswire.decode_request(h("05010003" + "00" + "0050"), 0)
+        Err(SocksBadDomain(n)) => test.assert_eq(n, 0)
+        _                      => test.fail("a domain of zero bytes is refused")
+
+    test.case("a prefix of a request is incomplete at every length")
+    let whole = h("05010003" + "0b" + "6578616d706c652e636f6d" + "01bb")
+    for n in 0..18
+        match sockswire.decode_request(whole[0:n], 0)
+            Err(e) => test.assert(sockserr.is_incomplete(e))
+            Ok(_)  => test.fail("a prefix of a request is not a request")
+
+    test.case("a port outside sixteen bits is refused when written")
+    var out: [u8] = []
+    let big = SocksRequest { command: SocksConnect, address: socksaddr.ipv4(1, 2, 3, 4), port: 65536 }
+    test.assert(says(sockswire.encode_request(var out, big), "port 65536"))
+    let neg = SocksRequest { command: SocksConnect, address: socksaddr.ipv4(1, 2, 3, 4), port: -1 }
+    test.assert(says(sockswire.encode_request(var out, neg), "port -1"))
+    test.assert_eq(list.len(out), 0)
+
+    test.case("a malformed address writes nothing")
+    let short = SocksRequest { command: SocksConnect, address: SocksAddrIpv4([1 as u8, 2 as u8]), port: 1 }
+    test.assert(says(sockswire.encode_request(var out, short), "an address of 2"))
+    test.assert_eq(list.len(out), 0)
+
+@test
+fn test_a_reply_carries_a_code_and_the_bound_address() [io]
+    // RFC 1928 section 6: VER 05, REP 00, RSV 00, ATYP 01, BND.ADDR, BND.PORT.
+    var out: [u8] = []
+    let m = SocksReplyMessage { reply: SocksReplySucceeded,
+        address: socksaddr.ipv4(10, 0, 0, 1),
+        port: 1080 }
+    test.assert_eq(wrote(sockswire.encode_reply(var out, m)), 10)
+    test.assert_eq(out, h("05000001" + "0a000001" + "0438"))
+    match sockswire.decode_reply(out, 0)
+        Ok(r)  =>
+            test.assert(sockscode.reply_is_success(r.message.reply))
+            test.assert_eq(r.message.port, 1080)
+            test.assert_eq(r.next, 10)
+        Err(_) => test.fail("the reply written is readable")
+
+    test.case("each code reads back as itself")
+    for code in 0..12
+        var one: [u8] = []
+        let _e = sockswire.encode_reply(var one, SocksReplyMessage { reply: sockscode.reply_of_code(code),
+            address: socksaddr.ipv4(0, 0, 0, 0),
+            port: 0 })
+        match sockswire.decode_reply(one, 0)
+            Ok(r)  => test.assert_eq(sockscode.reply_code(r.message.reply), code)
+            Err(_) => test.fail("every code is readable")
+
+    test.case("a failure reply is the zero address and port")
+    var f: [u8] = []
+    let _f = sockswire.encode_reply(var f, sockswire.failure_reply(SocksReplyConnectionRefused))
+    test.assert_eq(f, h("05050001" + "00000000" + "0000"))
+
+    test.case("a wrong version, a reserved byte, a short reply and a bad port")
+    match sockswire.decode_reply(h("0400000100000000" + "0000"), 0)
+        Err(SocksBadVersion(_)) => test.assert(true)
+        _                       => test.fail("the version is checked")
+    match sockswire.decode_reply(h("0500010100000000" + "0000"), 0)
+        Err(SocksBadReserved(got)) => test.assert_eq(got, 1)
+        _                          => test.fail("RSV must be zero")
+    match sockswire.decode_reply(h("05000001" + "00000000" + "00"), 0)
+        Err(SocksTruncated(need, have)) =>
+            test.assert_eq(need, 2)
+            test.assert_eq(have, 1)
+        _                               => test.fail("the port is two bytes")
+    var scratch: [u8] = []
+    test.assert(says(sockswire.encode_reply(var scratch, SocksReplyMessage { reply: SocksReplySucceeded,
+        address: socksaddr.ipv4(0, 0, 0, 0),
+        port: 70000 }),
+    "port 70000"))
+
+@test
+fn test_a_udp_datagram_starts_with_the_relay_header() [io]
+    // RFC 1928 section 7: RSV 00 00, FRAG 00, ATYP 01, DST.ADDR, DST.PORT, DATA.
+    var out: [u8] = []
+    let hdr = SocksUdpHeader { fragment: 0, address: socksaddr.ipv4(8, 8, 8, 8), port: 53 }
+    test.assert_eq(wrote(sockswire.encode_udp_header(var out, hdr)), 10)
+    test.assert_eq(out, h("0000000108080808" + "0035"))
+    list.push(out, 0xAB as u8)
+
+    match sockswire.decode_udp_header(out, 0)
+        Ok(r)  =>
+            test.assert(sockswire.udp_is_standalone(r.header))
+            test.assert_eq(r.header.port, 53)
+            test.assert_eq(r.payload_at, 10)
+            test.assert_eq(out[r.payload_at], 0xAB as u8)
+        Err(_) => test.fail("the header written is readable")
+
+    test.case("a fragment number is read and reported")
+    match sockswire.decode_udp_header(h("0000010108080808" + "0035"), 0)
+        Ok(r)  =>
+            test.assert_eq(r.header.fragment, 1)
+            test.assert(not sockswire.udp_is_standalone(r.header))
+        Err(_) => test.fail("a fragment is readable")
+
+    test.case("a domain destination")
+    var d: [u8] = []
+    let _d = sockswire.encode_udp_header(var d, SocksUdpHeader { fragment: 0, address: SocksAddrDomain("a.b"), port: 7 })
+    test.assert_eq(d, h("00000003" + "03" + "612e62" + "0007"))
+
+    test.case("a reserved field, a short header, a bad fragment and a bad port")
+    match sockswire.decode_udp_header(h("0100000108080808" + "0035"), 0)
+        Err(SocksBadReserved(got)) => test.assert_eq(got, 256)
+        _                          => test.fail("RSV is two zero bytes")
+    match sockswire.decode_udp_header(h("000000"), 0)
+        Err(SocksTruncated(_, _)) => test.assert(true)
+        _                         => test.fail("three bytes are not a header")
+    match sockswire.decode_udp_header(h("0000000108080808" + "00"), 0)
+        Err(SocksTruncated(_, _)) => test.assert(true)
+        _                         => test.fail("the port is two bytes")
+    var scratch: [u8] = []
+    test.assert(says(sockswire.encode_udp_header(var scratch, SocksUdpHeader { fragment: 256, address: socksaddr.ipv4(1, 1, 1, 1), port: 1 }),
+        "the datagram is fragment 256"))
+    test.assert(says(sockswire.encode_udp_header(var scratch, SocksUdpHeader { fragment: 0, address: socksaddr.ipv4(1, 1, 1, 1), port: -3 }),
+        "port -3"))
+    test.assert_eq(list.len(scratch), 0)
+
+@test
+fn test_an_address_is_written_and_named() [io]
+    test.case("the constructors check lengths")
+    match socksaddr.domain("")
+        Err(SocksBadDomain(n)) => test.assert_eq(n, 0)
+        _                      => test.fail("an empty name is refused")
+    match socksaddr.domain("x".repeat(256))
+        Err(SocksBadDomain(n)) => test.assert_eq(n, 256)
+        _                      => test.fail("256 bytes do not fit one length byte")
+    match socksaddr.domain("x".repeat(255))
+        Ok(a)  => test.assert_eq(socksaddr.address_type(a), 3)
+        Err(_) => test.fail("255 bytes fit")
+    match socksaddr.ipv6(h("0102"))
+        Err(SocksBadAddressLength(n)) => test.assert_eq(n, 2)
+        _                             => test.fail("an IPv6 address is sixteen octets")
+
+    test.case("the address types are 1, 3 and 4")
+    test.assert_eq(socksaddr.address_type(socksaddr.ipv4(1, 2, 3, 4)), 1)
+    test.assert_eq(socksaddr.address_type(SocksAddrIpv6(h("00000000000000000000000000000001"))), 4)
+
+    test.case("an oversized domain and a short IPv6 address write nothing")
+    var out: [u8] = []
+    test.assert(says(socksaddr.encode_address_into(var out, SocksAddrDomain("y".repeat(300))),
+        "a domain name of 300"))
+    test.assert(says(socksaddr.encode_address_into(var out, SocksAddrIpv6(h("0102"))), "an address of 2"))
+    test.assert_eq(list.len(out), 0)
+
+    test.case("a prefix of each form is incomplete")
+    match socksaddr.decode_address(h("0301"), 0)
+        Err(SocksTruncated(_, _)) => test.assert(true)
+        _                         => test.fail("the name is cut short")
+    match socksaddr.decode_address(h("04010203"), 0)
+        Err(SocksTruncated(_, _)) => test.assert(true)
+        _                         => test.fail("the IPv6 address is cut short")
+    match socksaddr.decode_address(h("03"), 0)
+        Err(SocksTruncated(_, _)) => test.assert(true)
+        _                         => test.fail("the length is missing")
+    match socksaddr.decode_address(h(""), 0)
+        Err(SocksTruncated(_, _)) => test.assert(true)
+        _                         => test.fail("nothing is not an address")
+
+    test.case("the text form of an IPv6 address follows RFC 5952")
+    test.assert_eq(socksaddr.address_text(SocksAddrIpv6(h("00000000000000000000000000000001"))), "::1")
+    test.assert_eq(socksaddr.address_text(SocksAddrIpv6(h("00000000000000000000000000000000"))), "::")
+    test.assert_eq(socksaddr.address_text(SocksAddrIpv6(h("20010db8000000000000000000000000"))), "2001:db8::")
+    test.assert_eq(socksaddr.address_text(SocksAddrIpv6(h("20010db8000000010000000000020003"))),
+        "2001:db8:0:1::2:3")
+    test.assert_eq(socksaddr.address_text(SocksAddrIpv6(h("20010db8000100020003000400050006"))),
+        "2001:db8:1:2:3:4:5:6")
+    test.assert_eq(socksaddr.address_text(SocksAddrIpv6(h("2001000000010000000200000003ffff"))),
+        "2001:0:1:0:2:0:3:ffff")
+    test.assert_eq(socksaddr.address_text(SocksAddrIpv6(h("0001000200030004000500060007000a"))),
+        "1:2:3:4:5:6:7:a")
+    test.assert_eq(socksaddr.address_text(SocksAddrDomain("example.com")), "example.com")

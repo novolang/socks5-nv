@@ -1,0 +1,182 @@
+// socksaddr.nv — the ATYP, ADDR form of RFC 1928 section 5: an IPv4
+// address, a domain name or an IPv6 address, as one value and as the
+// bytes that carry it.
+//
+// A domain name travels as its text and is resolved by the server, which
+// is what lets a client reach a name its own resolver cannot see.  A
+// `Str` holds it; an address is the octets of the address in network
+// order.
+
+use std.str
+use sockserr
+
+// Address type 1: four octets.
+pub const SOCKS_ATYP_IPV4 = 1
+// Address type 3: one length byte and then that many bytes of name.
+pub const SOCKS_ATYP_DOMAIN = 3
+// Address type 4: sixteen octets.
+pub const SOCKS_ATYP_IPV6 = 4
+
+// The longest domain name one length byte can carry.
+pub const SOCKS_DOMAIN_MAX = 255
+
+// A destination or a bound address.
+pub enum SocksAddress
+    // Four octets, most significant first.
+    SocksAddrIpv4(octets: [u8])
+    // A domain name, as the bytes of the text.
+    SocksAddrDomain(name: Str)
+    // Sixteen octets, most significant first.
+    SocksAddrIpv6(octets: [u8])
+
+// Append the bytes of `s` to `out`.
+pub fn push_text(var out: [u8], s: Str)
+    for i in 0..str.len(s)
+        list.push(out, str.byte_at_or(s, i, 0) as u8)
+
+// The `n` bytes at `at` as text.  The caller has checked that they are
+// there.
+pub fn text_from(data: [u8], at: Int, n: Int) -> Str
+    var s = ""
+    for i in 0..n
+        s = s + str.from_byte(data[at + i] as Int)
+    s
+
+// An IPv4 address from its four octets.  Each argument is reduced to
+// its low eight bits.
+pub fn ipv4(a: Int, b: Int, c: Int, d: Int) -> SocksAddress
+    SocksAddrIpv4([(a & 255) as u8, (b & 255) as u8, (c & 255) as u8, (d & 255) as u8])
+
+// An IPv6 address from its sixteen octets.  Any other length is
+// refused.
+pub fn ipv6(octets: [u8]) -> Result<SocksAddress, SocksError>
+    if list.len(octets) != 16
+        return Err(SocksBadAddressLength(list.len(octets)))
+    Ok(SocksAddrIpv6(octets))
+
+// A domain name, which is 1 to 255 bytes (RFC 1928 section 5).
+pub fn domain(name: Str) -> Result<SocksAddress, SocksError>
+    let n = str.len(name)
+    if n < 1 or n > SOCKS_DOMAIN_MAX
+        return Err(SocksBadDomain(n))
+    Ok(SocksAddrDomain(name))
+
+// The ATYP byte that introduces an address.
+pub fn address_type(a: SocksAddress) -> Int
+    match a
+        SocksAddrIpv4(_)   => SOCKS_ATYP_IPV4
+        SocksAddrDomain(_) => SOCKS_ATYP_DOMAIN
+        SocksAddrIpv6(_)   => SOCKS_ATYP_IPV6
+
+// Append the ATYP byte and the address to `out`.  Answers the number of
+// bytes written, and writes nothing when the address is malformed.
+pub fn encode_address_into(var out: [u8], a: SocksAddress) -> Result<Int, SocksError>
+    match a
+        SocksAddrIpv4(octets) =>
+            if list.len(octets) != 4
+                return Err(SocksBadAddressLength(list.len(octets)))
+            list.push(out, SOCKS_ATYP_IPV4 as u8)
+            for i in 0..4
+                list.push(out, octets[i])
+            Ok(5)
+        SocksAddrIpv6(octets) =>
+            if list.len(octets) != 16
+                return Err(SocksBadAddressLength(list.len(octets)))
+            list.push(out, SOCKS_ATYP_IPV6 as u8)
+            for i in 0..16
+                list.push(out, octets[i])
+            Ok(17)
+        SocksAddrDomain(name) =>
+            let n = str.len(name)
+            if n < 1 or n > SOCKS_DOMAIN_MAX
+                return Err(SocksBadDomain(n))
+            list.push(out, SOCKS_ATYP_DOMAIN as u8)
+            list.push(out, n as u8)
+            push_text(var out, name)
+            Ok(2 + n)
+
+// An address and the offset of the byte after it.
+pub struct SocksAddressRead
+    address: SocksAddress
+    next: Int
+
+// Read the ATYP byte and the address at `at`.  Answers
+// `SocksTruncated` when the bytes stop before the address does.
+pub fn decode_address(data: [u8], at: Int) -> Result<SocksAddressRead, SocksError>
+    sockserr.require(data, at, 1)!
+    let atyp = data[at] as Int
+    if atyp == SOCKS_ATYP_IPV4
+        sockserr.require(data, at, 5)!
+        Ok(SocksAddressRead { address: SocksAddrIpv4(data[at + 1:at + 5]), next: at + 5 })
+    elif atyp == SOCKS_ATYP_IPV6
+        sockserr.require(data, at, 17)!
+        Ok(SocksAddressRead { address: SocksAddrIpv6(data[at + 1:at + 17]), next: at + 17 })
+    elif atyp == SOCKS_ATYP_DOMAIN
+        sockserr.require(data, at, 2)!
+        let n = data[at + 1] as Int
+        if n < 1
+            return Err(SocksBadDomain(n))
+        sockserr.require(data, at, 2 + n)!
+        Ok(SocksAddressRead { address: SocksAddrDomain(text_from(data, at + 2, n)), next: at + 2 + n })
+    else
+        Err(SocksBadAddressType(atyp))
+
+const HEX = "0123456789abcdef"
+
+// A group of an IPv6 address in lower-case hexadecimal without leading
+// zeros.
+fn group_text(v: Int) -> Str
+    if v == 0
+        return "0"
+    var out = ""
+    var started = false
+    for shift in [12, 8, 4, 0]
+        let d = (v >> shift) & 15
+        if d != 0 or started
+            started = true
+            out = out + str.slice(HEX, d, d + 1)
+    out
+
+// The sixteen-bit group `g` of an IPv6 address.
+fn group_of(octets: [u8], g: Int) -> Int
+    (octets[2 * g] as Int << 8) | octets[2 * g + 1] as Int
+
+// The address as text: dotted decimal, the domain itself, or the
+// colon-separated form of RFC 5952 with the longest run of zero groups
+// written `::`.
+pub fn address_text(a: SocksAddress) -> Str
+    match a
+        SocksAddrIpv4(o)      =>
+            str.from_int(o[0] as Int) + "." + str.from_int(o[1] as Int) + "." + str.from_int(o[2] as Int) + "." + str.from_int(o[3] as Int)
+        SocksAddrDomain(name) => name
+        SocksAddrIpv6(o)      =>
+            // The longest run of zero groups, if it is at least two long.
+            var best_at = -1
+            var best_len = 0
+            var run_at = 0
+            var run_len = 0
+            for g in 0..8
+                if group_of(o, g) == 0
+                    if run_len == 0
+                        run_at = g
+                    run_len = run_len + 1
+                    if run_len > best_len
+                        best_len = run_len
+                        best_at = run_at
+                else
+                    run_len = 0
+            if best_len < 2
+                best_at = -1
+                best_len = 0
+            var out = ""
+            var g = 0
+            while g < 8
+                if g == best_at
+                    out = out + "::"
+                    g = g + best_len
+                else
+                    if g > 0 and g != best_at + best_len
+                        out = out + ":"
+                    out = out + group_text(group_of(o, g))
+                    g = g + 1
+            out

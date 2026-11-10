@@ -1,0 +1,88 @@
+// socks_code_tests.nv — the numbers RFC 1928 and RFC 1929 assign, with
+// their names, and the words of every refusal.
+
+use std.test
+use std.str
+use sockscode
+use sockserr
+use socksaddr
+
+@test
+fn test_every_assigned_reply_code_has_a_name() [io]
+    // RFC 1928 section 6.
+    let names = ["succeeded", "general SOCKS server failure", "connection not allowed by ruleset",
+                 "network unreachable", "host unreachable", "connection refused",
+                 "TTL expired", "command not supported", "address type not supported"]
+    for code in 0..9
+        let r = sockscode.reply_of_code(code)
+        test.assert_eq(sockscode.reply_code(r), code)
+        test.assert_eq(sockscode.reply_name(r), names[code])
+
+    test.case("the rest are unassigned and keep their number")
+    let r = sockscode.reply_of_code(77)
+    test.assert_eq(sockscode.reply_code(r), 77)
+    test.assert_eq(sockscode.reply_name(r), "unassigned reply 77")
+
+    test.case("only 0 is success")
+    test.assert(sockscode.reply_is_success(sockscode.reply_of_code(0)))
+    for code in 1..12
+        test.assert(not sockscode.reply_is_success(sockscode.reply_of_code(code)))
+
+@test
+fn test_the_three_commands_and_the_others() [io]
+    test.assert_eq(sockscode.command_code(SocksConnect), 1)
+    test.assert_eq(sockscode.command_code(SocksBind), 2)
+    test.assert_eq(sockscode.command_code(SocksUdpAssociate), 3)
+    test.assert_eq(sockscode.command_code(SocksCommandOther(200)), 200)
+    test.assert_eq(sockscode.command_name(sockscode.command_of_code(1)), "CONNECT")
+    test.assert_eq(sockscode.command_name(sockscode.command_of_code(2)), "BIND")
+    test.assert_eq(sockscode.command_name(sockscode.command_of_code(3)), "UDP ASSOCIATE")
+    test.assert_eq(sockscode.command_name(sockscode.command_of_code(4)), "command 4")
+
+@test
+fn test_the_methods_have_names() [io]
+    test.assert_eq(sockscode.method_name(0), "no authentication")
+    test.assert_eq(sockscode.method_name(1), "GSS-API")
+    test.assert_eq(sockscode.method_name(2), "username and password")
+    test.assert_eq(sockscode.method_name(255), "no acceptable method")
+    test.assert_eq(sockscode.method_name(3), "IANA-assigned method 3")
+    test.assert_eq(sockscode.method_name(127), "IANA-assigned method 127")
+    test.assert_eq(sockscode.method_name(128), "private method 128")
+
+@test
+fn test_every_refusal_says_what_it_is() [io]
+    let all = [SocksTruncated(4, 2), SocksBadVersion(4), SocksBadAuthVersion(2),
+               SocksBadAddressType(9), SocksBadDomain(0), SocksBadMethodCount(0),
+               SocksBadMethod(300), SocksBadReserved(1), SocksBadPort(-1),
+               SocksBadCredential(0), SocksBadAddressLength(3), SocksFragmented(2),
+               SocksAuthRejected(1), SocksUnsupportedCommand(9), SocksMethodNotOffered(2),
+               SocksNoAcceptableMethod, SocksMissingCredentials, SocksWrongState]
+    for e in all
+        test.assert(str.len(e.message()) > 10)
+
+    test.case("only a short read is incomplete")
+    var incomplete = 0
+    for e in all
+        if sockserr.is_incomplete(e)
+            incomplete = incomplete + 1
+    test.assert_eq(incomplete, 1)
+    test.assert_eq(SocksTruncated(4, 2).message(), "the message needs 4 bytes and 2 are there")
+
+@test
+fn test_the_helpers_every_decoder_uses() [io]
+    test.case("require answers the count, or how many bytes there were")
+    match sockserr.require([1 as u8, 2 as u8, 3 as u8], 1, 2)
+        Ok(n)  => test.assert_eq(n, 2)
+        Err(_) => test.fail("two bytes are there from offset 1")
+    match sockserr.require([1 as u8, 2 as u8, 3 as u8], 1, 3)
+        Err(SocksTruncated(need, have)) =>
+            test.assert_eq(need, 3)
+            test.assert_eq(have, 2)
+        _                               => test.fail("only two are")
+
+    test.case("text goes into bytes and comes back")
+    var out: [u8] = []
+    socksaddr.push_text(var out, "proxy")
+    test.assert_eq(list.len(out), 5)
+    test.assert_eq(out[0], 112 as u8)
+    test.assert_eq(socksaddr.text_from(out, 1, 3), "rox")

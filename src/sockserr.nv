@@ -1,0 +1,93 @@
+// sockserr.nv — the refusals a SOCKS5 message can meet.
+//
+// A message that is cut short is its own variant, `SocksTruncated`,
+// because on a stream it is not a fault: the caller reads more bytes and
+// tries again.  `is_incomplete` separates it from the others.
+
+use std.str
+
+// Why a message was not read or not written.
+pub enum SocksError
+    // Fewer bytes than the field being read needs.  `need` is the
+    // number of bytes the message needs in total, counted from the
+    // offset the read started at, and `have` is how many were there.
+    SocksTruncated(need: Int, have: Int)
+    // The first byte of a negotiation, request or reply is not 5
+    // (RFC 1928 section 3).
+    SocksBadVersion(got: Int)
+    // The first byte of an RFC 1929 message is not 1.
+    SocksBadAuthVersion(got: Int)
+    // An address type other than 1, 3 and 4 (RFC 1928 section 5).
+    SocksBadAddressType(got: Int)
+    // A domain name that is empty or longer than 255 bytes.
+    SocksBadDomain(length: Int)
+    // A greeting that offers no method, or more than 255.
+    SocksBadMethodCount(count: Int)
+    // A method that is not a number from 0 to 255.
+    SocksBadMethod(got: Int)
+    // A reserved byte that is not zero.
+    SocksBadReserved(got: Int)
+    // A port outside 0 to 65535.
+    SocksBadPort(got: Int)
+    // A user name or a password that is empty or longer than 255 bytes
+    // (RFC 1929 section 2).
+    SocksBadCredential(length: Int)
+    // An IPv4 or IPv6 address of the wrong number of octets.
+    SocksBadAddressLength(got: Int)
+    // A UDP datagram whose FRAG field is not zero.  This package does
+    // not reassemble fragments (RFC 1928 section 7).
+    SocksFragmented(fragment: Int)
+    // The server answered the username and password with a status other
+    // than 0 (RFC 1929 section 2).
+    SocksAuthRejected(status: Int)
+    // A request for a command number RFC 1928 does not define.  The
+    // server answers it with reply 7.
+    SocksUnsupportedCommand(code: Int)
+    // The server chose a method the client did not offer.
+    SocksMethodNotOffered(method: Int)
+    // The server answered 255: none of the offered methods is
+    // acceptable (RFC 1928 section 3).
+    SocksNoAcceptableMethod
+    // The client offered a method the server must be configured for, and
+    // asked for user name and password with none set.
+    SocksMissingCredentials
+    // A call that is not valid in the state the exchange is in.
+    SocksWrongState
+
+// What went wrong, in words, for a caller that logs rather than
+// branches.  `Result<_, SocksError>` requires it.
+impl Error for SocksError
+    fn message(self) -> Str
+        match self
+            SocksTruncated(need, have) => "the message needs " + str.from_int(need) + " bytes and " + str.from_int(have) + " are there"
+            SocksBadVersion(got)       => "the version byte is " + str.from_int(got) + " and SOCKS5 is 5"
+            SocksBadAuthVersion(got)   => "the authentication version byte is " + str.from_int(got) + " and RFC 1929 is 1"
+            SocksBadAddressType(got)   => "address type " + str.from_int(got) + " is not 1, 3 or 4"
+            SocksBadDomain(length)     => "a domain name of " + str.from_int(length) + " bytes is not 1 to 255"
+            SocksBadMethodCount(count) => "a greeting of " + str.from_int(count) + " methods is not 1 to 255"
+            SocksBadMethod(got)        => "method " + str.from_int(got) + " is not a byte"
+            SocksBadReserved(got)      => "the reserved byte is " + str.from_int(got) + " and must be 0"
+            SocksBadPort(got)          => "port " + str.from_int(got) + " is not 0 to 65535"
+            SocksBadCredential(length) => "a user name or password of " + str.from_int(length) + " bytes is not 1 to 255"
+            SocksBadAddressLength(got) => "an address of " + str.from_int(got) + " octets is not 4 or 16"
+            SocksFragmented(fragment)  => "the datagram is fragment " + str.from_int(fragment) + " and fragments are not reassembled"
+            SocksAuthRejected(status)  => "the server rejected the user name and password with status " + str.from_int(status)
+            SocksUnsupportedCommand(c) => "command " + str.from_int(c) + " is not defined by RFC 1928"
+            SocksMethodNotOffered(m)   => "the server chose method " + str.from_int(m) + ", which was not offered"
+            SocksNoAcceptableMethod    => "the server accepts none of the offered methods"
+            SocksMissingCredentials    => "user name and password were chosen and none were configured"
+            SocksWrongState            => "the call is not valid in the state the exchange is in"
+
+// Whether `n` bytes are there from offset `at`: `Ok(n)`, or the
+// truncation that says how many were.
+pub fn require(data: [u8], at: Int, n: Int) -> Result<Int, SocksError>
+    let have = list.len(data) - at
+    if have < n
+        return Err(SocksTruncated(n, have))
+    Ok(n)
+
+// Whether a read failed only because more bytes are needed.
+pub fn is_incomplete(e: SocksError) -> Bool
+    match e
+        SocksTruncated(_, _) => true
+        _                    => false
